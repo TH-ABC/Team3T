@@ -1,0 +1,260 @@
+import { Order, OrderStatus, DailyRevenue, Store, User, AuthResponse, DailyStat, StoreHistoryItem, Role } from '../types';
+
+// ============================================================================
+// CẤU HÌNH KẾT NỐI GOOGLE SHEET
+// ============================================================================
+const API_URL = 'https://script.google.com/macros/s/AKfycbyw4ZdfirgKUHyXMH8Ro7UZ6-VWCdf1hgqU37ilLvNt2RwzusSPG_HUc_mi8z-9tInR/exec'; 
+// ============================================================================
+
+const callAPI = async (action: string, method: 'GET' | 'POST' = 'GET', data?: any) => {
+  const cleanUrl = API_URL.trim();
+  if (cleanUrl.includes('HAY_DAN_URL') || !cleanUrl) {
+    console.warn("Chưa cấu hình API URL Google Apps Script.");
+    return [];
+  }
+
+  const nocache = `${Date.now()}_${Math.random().toString(36).substring(7)}`;
+  let url = `${cleanUrl}?action=${action}&_t=${nocache}`;
+  
+  if (method === 'GET' && data) {
+    const params = new URLSearchParams(data).toString();
+    url += `&${params}`;
+  }
+  
+  const options: RequestInit = {
+    method: method,
+    headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+    keepalive: true // Giữ kết nối để hoàn tất request ngay cả khi đóng tab
+  };
+
+  if (method === 'POST') {
+    options.body = JSON.stringify({ action: action, ...data });
+  }
+
+  try {
+    const response = await fetch(url, options);
+    const text = await response.text();
+    try {
+      const json = JSON.parse(text);
+      if (json && json.error) return { success: false, error: json.error };
+      return json;
+    } catch (e) {
+      return { success: false, error: "Lỗi phản hồi từ Google Sheet." };
+    }
+  } catch (error) {
+    return { success: false, error: String(error) };
+  }
+};
+
+const parseSheetNumber = (val: any): string => {
+  if (val === null || val === undefined || val === '') return '0';
+  if (typeof val === 'number') return String(val);
+  const str = String(val).trim().replace(/,/g, '');
+  const num = Number(str); 
+  return isNaN(num) ? '0' : String(num);
+};
+
+const getClientIP = async (): Promise<string> => {
+    try {
+        const response = await fetch('https://api.ipify.org?format=json');
+        const data = await response.json();
+        return data.ip || 'Unknown';
+    } catch (error) { return 'Unknown'; }
+};
+
+export const sheetService = {
+  login: async (username: string, password: string): Promise<AuthResponse> => {
+    const userIP = await getClientIP();
+    const result = await callAPI('login', 'POST', { username, password, ip: userIP });
+    if (result.success && result.user) return { success: true, user: result.user };
+    return { success: false, error: result.error || 'Đăng nhập thất bại' };
+  },
+
+  // --- USER MANAGEMENT ---
+  createUser: async (userData: any): Promise<AuthResponse> => {
+    return await callAPI('createUser', 'POST', userData);
+  },
+
+  getUsers: async (): Promise<User[]> => {
+    const data = await callAPI('getUsers', 'GET');
+    if (Array.isArray(data)) {
+        return data.map((u: any) => ({
+            username: u.username,
+            fullName: u.fullName,
+            role: u.role,
+            email: u.email,
+            phone: u.phone,
+            status: u.status || 'Active'
+        }));
+    }
+    return [];
+  },
+
+  updateUser: async (username: string, role?: string, status?: string): Promise<any> => {
+    return await callAPI('updateUser', 'POST', { username, role, status });
+  },
+  // -----------------------
+
+  // --- ROLE MANAGEMENT ---
+  getRoles: async (): Promise<Role[]> => {
+    const data = await callAPI('getRoles', 'GET');
+    return Array.isArray(data) ? data : [];
+  },
+
+  addRole: async (roleName: string, level: number): Promise<any> => {
+    return await callAPI('addRole', 'POST', { role: roleName, level: level });
+  },
+  // -----------------------
+
+  // GET ORDERS: Hỗ trợ lấy theo tháng và trả về fileId
+  getOrders: async (monthYear?: string): Promise<{ orders: Order[], fileId: string | null }> => {
+    const targetMonth = monthYear || new Date().toISOString().slice(0, 7);
+    const data = await callAPI('getOrders', 'GET', { month: targetMonth });
+    
+    // Xử lý dữ liệu trả về { orders: [], fileId: ... }
+    if (data) {
+        if (data.orders && Array.isArray(data.orders)) {
+            const mappedOrders = data.orders.map((item: any) => ({
+                date: item.date ? String(item.date) : '',        // A
+                id: String(item.id || ''),                        // B
+                storeId: String(item.storeId || ''),              // C
+                type: String(item.type || ''),                    // D
+                sku: String(item.sku || ''),                      // E
+                quantity: item.quantity || '1',                   // F
+                tracking: String(item.tracking || ''),            // G
+                isChecked: item.isChecked === true || item.isChecked === "TRUE", // H
+                link: item.link || '',                            // I
+                status: item.status || 'Pending',                 // J
+                note: item.note || '',                            // K
+                handler: item.handler || item.user || '',         // L
+                actionRole: item.actionRole || ''                 // M
+            }));
+            return { orders: mappedOrders, fileId: data.fileId || null };
+        }
+        
+        // Fallback for legacy array response
+        if (Array.isArray(data)) {
+            return { orders: [], fileId: null };
+        }
+    }
+    
+    return { orders: [], fileId: null };
+  },
+
+  addOrder: async (order: Order): Promise<Order> => {
+    // order.handler sẽ được truyền vào payload
+    await callAPI('addOrder', 'POST', {
+        ...order,
+        user: order.handler // Map handler -> user trong payload
+    });
+    return order;
+  },
+
+  // Update a specific field of an order directly to Google Sheet
+  updateOrder: async (fileId: string, orderId: string, field: string, value: any): Promise<any> => {
+    return await callAPI('updateOrder', 'POST', { fileId, orderId, field, value });
+  },
+
+  // Update multiple fields for a single order (BATCH UPDATE - Single Request)
+  updateOrderBatch: async (fileId: string, orderId: string, data: Partial<Order>): Promise<any> => {
+    // Calls the new optimized 'updateOrderRow' endpoint in GAS
+    return await callAPI('updateOrderRow', 'POST', { fileId, orderId, data });
+  },
+
+  // --- QUẢN LÝ ĐƠN VỊ (UNITS) ---
+  getUnits: async (): Promise<string[]> => {
+    const data = await callAPI('getUnits', 'GET');
+    return Array.isArray(data) ? data : [];
+  },
+
+  addUnit: async (unit: string): Promise<any> => {
+    return await callAPI('addUnit', 'POST', { unit });
+  },
+  // ------------------------------
+
+  getStores: async (): Promise<Store[]> => {
+    const data = await callAPI('getStores', 'GET');
+    if (Array.isArray(data)) {
+      return data.map((item: any) => ({
+          id: String(item.id || ''),
+          name: item.name,
+          url: item.url,
+          region: item.region || '', 
+          status: item.status || 'LIVE',
+          listing: parseSheetNumber(item.listing),
+          sale: parseSheetNumber(item.sale)
+      }));
+    }
+    return [];
+  },
+
+  addStore: async (storeData: any): Promise<Store> => {
+    const newStore: Store = {
+      id: `ST-${Date.now().toString().slice(-6)}`,
+      name: storeData.name,
+      url: storeData.url,
+      region: storeData.region,
+      status: 'LIVE', listing: '0', sale: '0'
+    };
+    await callAPI('addStore', 'POST', newStore);
+    return newStore;
+  },
+
+  deleteStore: async (storeId: string): Promise<any> => {
+    return await callAPI('deleteStore', 'POST', { id: storeId });
+  },
+
+  getDailyStats: async (): Promise<DailyStat[]> => {
+    const data = await callAPI('getDailyStats', 'GET');
+    return Array.isArray(data) ? data : [];
+  },
+  
+  getStoreHistory: async (storeId: string): Promise<StoreHistoryItem[]> => {
+    const data = await callAPI('getStoreHistory', 'POST', { storeId });
+    return Array.isArray(data) ? data : [];
+  },
+
+  triggerDebugSnapshot: async (): Promise<any> => {
+      return await callAPI('debugSnapshot', 'POST', {});
+  },
+
+  getDashboardStats: async () => {
+    const stores = await sheetService.getStores();
+    const totalSalesCount = stores.reduce((sum, s) => sum + (Number(s.sale.replace(/,/g,'')) || 0), 0);
+    const revenue = totalSalesCount * 500000;
+    return { revenue, netIncome: revenue * 0.3, inventoryValue: 55000000, debt: 0 };
+  },
+
+  getDailyRevenue: async (): Promise<DailyRevenue[]> => {
+    try {
+      // Lấy lịch sử thống kê tổng
+      const stats = await sheetService.getDailyStats();
+      if (!stats || stats.length < 2) return [];
+
+      // Sắp xếp theo ngày tăng dần để tính toán
+      const sortedStats = [...stats].sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
+      
+      const dailyRevenue: DailyRevenue[] = [];
+      const AVERAGE_ORDER_VALUE = 500000; // Giả định giá trị trung bình mỗi đơn
+
+      // Tính doanh thu từng ngày dựa trên chênh lệch tổng Sale so với ngày trước đó
+      for (let i = 1; i < sortedStats.length; i++) {
+        const prev = sortedStats[i - 1];
+        const curr = sortedStats[i];
+        
+        // Số sale tăng thêm trong ngày
+        const saleDelta = Math.max(0, curr.totalSale - prev.totalSale);
+        
+        dailyRevenue.push({
+          date: curr.date,
+          amount: saleDelta * AVERAGE_ORDER_VALUE
+        });
+      }
+
+      return dailyRevenue;
+    } catch (error) {
+      console.error("Error calculating daily revenue:", error);
+      return [];
+    }
+  }
+};
